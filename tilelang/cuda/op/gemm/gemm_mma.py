@@ -9,7 +9,7 @@ from tilelang.utils.language import is_shared, is_fragment, is_full_region
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm.ir import Range
-from tvm import tir
+from tvm import tirx
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
 
@@ -18,6 +18,8 @@ GEMM_INST_MMA = "cuda.mma"
 
 
 class GemmMMA(GemmBase):
+    intrin_emitter_cls = TensorCoreIntrinEmitter
+
     @staticmethod
     def _is_fp8_e4m3(dtype: str) -> bool:
         return str(dtype) in {"float8_e4m3", "float8_e4m3fn", "float8_e4m3fnuz"}
@@ -39,12 +41,12 @@ class GemmMMA(GemmBase):
         if not mixed_fp8_fp4:
             raise AssertionError(f"Unsupported mixed MMA dtypes: A={a_dtype}, B={b_dtype}")
 
-    def _make_mma_emitter(self, target: Target, thread_nums: int, thread_var: tir.Var | None = None):
+    def _make_mma_emitter(self, target: Target, thread_nums: int, thread_var: tirx.Var | None = None):
         self._validate_mma_dtypes()
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_INST_MMA)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
-        emitter = TensorCoreIntrinEmitter(
+        emitter = self.intrin_emitter_cls(
             a_dtype=self.A.dtype,
             b_dtype=self.B.dtype,
             accum_dtype=self.accum_dtype,
@@ -98,8 +100,8 @@ class GemmMMA(GemmBase):
         layout_map: dict,
         target: Target,
         thread_bounds: Range,
-        thread_var: tir.Var,
-        mbar_phase_expr: tir.PrimExpr | None = None,
+        thread_var: tirx.Var,
+        mbar_phase_expr: tirx.PrimExpr | None = None,
     ):
         thread_nums = thread_bounds.extent
         mma_emitter = self._make_mma_emitter(target, thread_nums, thread_var=thread_var)
