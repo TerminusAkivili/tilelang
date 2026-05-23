@@ -7,8 +7,6 @@ from .mma_layout import (
     ldmatrix_trans_32x8_to_shared_16x16_layout,
     ldmatrix_32x16_to_shared_16x32_layout_a,
     ldmatrix_32x16_to_shared_16x32_layout_b,
-    ldmatrix_32x16_to_shared_16x32_fp4_layout_a,
-    ldmatrix_32x16_to_shared_16x32_fp4_layout_b,
     mma_store_32x8_to_shared_16x16_layout,
     mma_store_32x2_to_shared_8x8_layout_fp64,
 )
@@ -51,32 +49,19 @@ def get_ldmatrix_offset(
         else:
             new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
             return new_row_idx, new_col_idx
-    elif is_fp4_e2m1fn:
-        # FP4 uses the SM120 b4x16_p64 layout. Keep int4/uint4 on the generic
-        # sub-byte path below; they have different packed-byte offsets.
-        if matrix == "B" and transposed:
-            transform_func = ldmatrix_32x16_to_shared_16x32_fp4_layout_b
-            new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
-            return new_row_idx, new_col_idx
-        elif matrix == "A" and not transposed:
-            transform_func = ldmatrix_32x16_to_shared_16x32_fp4_layout_a
-            new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
-            return new_row_idx, new_col_idx
-        else:
-            raise ValueError("ldmatrix only supports B transposed and A non-transposed for float4_e2m1fn")
-    elif dtype_bits <= 8:
+    elif is_fp4_e2m1fn or dtype_bits <= 8:
+        # FP4 uses the SM120 b4x16_p64 coordinates directly; int4/uint4 still
+        # scale those coordinates to packed-byte offsets.
         if matrix == "B" and transposed:
             transform_func = ldmatrix_32x16_to_shared_16x32_layout_b
-            new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
-            pack_factor = 8 // dtype_bits
-            return new_row_idx, new_col_idx * pack_factor
         elif matrix == "A" and not transposed:
             transform_func = ldmatrix_32x16_to_shared_16x32_layout_a
-            new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
-            pack_factor = 8 // dtype_bits
-            return new_row_idx, new_col_idx * pack_factor
         else:
-            raise ValueError("ldmatrix only supports B transposed and A non-transposed for int8")
+            raise ValueError(f"ldmatrix only supports B transposed and A non-transposed for {dtype_obj}")
+        new_row_idx, new_col_idx = transform_func(row_idx, col_idx)
+        if not is_fp4_e2m1fn:
+            new_col_idx *= 8 // dtype_bits
+        return new_row_idx, new_col_idx
     else:
         raise ValueError(f"Unsupported dtype {dtype_obj}")
 

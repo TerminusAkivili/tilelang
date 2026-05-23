@@ -5,7 +5,6 @@
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)) ||                      \
     (defined(__CUDA_ARCH_LIST__) && (__CUDA_ARCH_LIST__ >= 1200))
 #include <cuda_fp4.h>
-#include <cute/numeric/numeric_types.hpp>
 
 // Wrapper for __nv_fp4_e2m1 with implicit conversions
 struct fp4_e2_t {
@@ -45,12 +44,6 @@ struct fp4_e2_t {
   // Implicit conversion to __half
   TL_DEVICE operator __half() const { return __half(float(*this)); }
 };
-
-namespace tl {
-template <> struct to_cute_type<::fp4_e2_t> {
-  using type = cute::float_e2m1_t;
-};
-} // namespace tl
 
 class fp4_e2_2_t {
 public:

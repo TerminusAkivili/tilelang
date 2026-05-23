@@ -4,7 +4,15 @@
 #include <cute/arch/mma_sm75.hpp>
 #include <cute/arch/mma_sm80.hpp>
 #include <cute/arch/mma_sm89.hpp>
+
+#if (defined(__CUDA_ARCH_LIST__) && (__CUDA_ARCH_LIST__ >= 1200)) ||           \
+    (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200))
+#define TL_HAS_SM120_MMA_DISPATCHER 1
 #include <cute/arch/mma_sm120.hpp>
+#else
+#define TL_HAS_SM120_MMA_DISPATCHER 0
+#endif
+
 #ifndef __CUDACC_RTC__
 #include <type_traits>
 #include <utility>
@@ -105,6 +113,49 @@ struct SM75_8x8x32_S32U4U4S32_TN {
   }
 };
 
+#if TL_HAS_SM120_MMA_DISPATCHER
+template <class Impl, bool ShiftA, bool ShiftB> struct SM120_16x8x32_F8F6F4_TN {
+  using DRegisters = typename Impl::DRegisters;
+  using ARegisters = typename Impl::ARegisters;
+  using BRegisters = typename Impl::BRegisters;
+  using CRegisters = typename Impl::CRegisters;
+
+  template <bool Shift>
+  CUTE_HOST_DEVICE static uint32_t shift_fp4_mma_operand(uint32_t value) {
+    if constexpr (Shift) {
+      return value << 2;
+    } else {
+      return value;
+    }
+  }
+
+  CUTE_HOST_DEVICE static void fma(float &d0, float &d1, float &d2, float &d3,
+                                   uint32_t const &a0, uint32_t const &a1,
+                                   uint32_t const &a2, uint32_t const &a3,
+                                   uint32_t const &b0, uint32_t const &b1,
+                                   float const &c0, float const &c1,
+                                   float const &c2, float const &c3) {
+    // SM120 FP4 MMA consumes the e2m1 payload from bits 2..5 of each
+    // byte-carrier lane, so FP4 operands are shifted immediately before fma.
+    Impl::fma(
+        d0, d1, d2, d3, shift_fp4_mma_operand<ShiftA>(a0),
+        shift_fp4_mma_operand<ShiftA>(a1), shift_fp4_mma_operand<ShiftA>(a2),
+        shift_fp4_mma_operand<ShiftA>(a3), shift_fp4_mma_operand<ShiftB>(b0),
+        shift_fp4_mma_operand<ShiftB>(b1), c0, c1, c2, c3);
+  }
+};
+
+using SM120_FP4_FP4_F32_TN = SM120_16x8x32_F8F6F4_TN<
+    cute::SM120_16x8x32_TN<cute::float_e2m1_t, cute::float_e2m1_t, float>, true,
+    true>;
+using SM120_FP8_FP4_F32_TN = SM120_16x8x32_F8F6F4_TN<
+    cute::SM120_16x8x32_TN<cute::float_e4m3_t, cute::float_e2m1_t, float>,
+    false, true>;
+using SM120_FP4_FP8_F32_TN = SM120_16x8x32_F8F6F4_TN<
+    cute::SM120_16x8x32_TN<cute::float_e2m1_t, cute::float_e4m3_t, float>, true,
+    false>;
+#endif
+
 template <DataType AType, DataType BType, DataType CType, int M, int N, int K,
           bool TransA, bool TransB, bool Saturate>
 struct MmaDispatcher {
@@ -119,9 +170,9 @@ struct MmaDispatcher {
   }
 };
 
-#define TL_DEFINE_MMA_DISPATCHER_IMPL(                                         \
-    ATypeEnum, BTypeEnum, CTypeEnum, MValue, NValue, KValue, TransAValue,      \
-    TransBValue, SaturateValue, ShiftAValue, ShiftBValue, ImplType)            \
+#define TL_DEFINE_MMA_DISPATCHER(ATypeEnum, BTypeEnum, CTypeEnum, MValue,      \
+                                 NValue, KValue, TransAValue, TransBValue,     \
+                                 SaturateValue, ImplType)                      \
   template <>                                                                  \
   struct MmaDispatcher<DataType::ATypeEnum, DataType::BTypeEnum,               \
                        DataType::CTypeEnum, MValue, NValue, KValue,            \
@@ -134,45 +185,11 @@ struct MmaDispatcher {
     static_assert(                                                             \
         std::is_same_v<typename Traits::DReg, typename Traits::CReg>,          \
         "tl::mma_sync requires matching accumulator/output regs");             \
-    template <bool Shift, class Reg>                                           \
-    static TL_DEVICE Reg maybe_shift_fp4_reg(Reg reg) {                        \
-      if constexpr (Shift) {                                                   \
-        return reg << 2;                                                       \
-      } else {                                                                 \
-        return reg;                                                            \
-      }                                                                        \
-    }                                                                          \
     static TL_DEVICE void exec(CRegType *d, const ARegType *a,                 \
                                const BRegType *b, const CRegType *c) {         \
-      if constexpr (ShiftAValue || ShiftBValue) {                              \
-        ARegType as[Traits::kARegs];                                           \
-        BRegType bs[Traits::kBRegs];                                           \
-        _Pragma("unroll") for (int i = 0; i < Traits::kARegs; ++i) {           \
-          as[i] = maybe_shift_fp4_reg<ShiftAValue>(a[i]);                      \
-        }                                                                      \
-        _Pragma("unroll") for (int i = 0; i < Traits::kBRegs; ++i) {           \
-          bs[i] = maybe_shift_fp4_reg<ShiftBValue>(b[i]);                      \
-        }                                                                      \
-        call_fma<Impl>(d, as, bs, c);                                          \
-      } else {                                                                 \
-        call_fma<Impl>(d, a, b, c);                                            \
-      }                                                                        \
+      call_fma<Impl>(d, a, b, c);                                              \
     }                                                                          \
   };
-
-#define TL_DEFINE_MMA_DISPATCHER(ATypeEnum, BTypeEnum, CTypeEnum, MValue,      \
-                                 NValue, KValue, TransAValue, TransBValue,     \
-                                 SaturateValue, ImplType)                      \
-  TL_DEFINE_MMA_DISPATCHER_IMPL(ATypeEnum, BTypeEnum, CTypeEnum, MValue,       \
-                                NValue, KValue, TransAValue, TransBValue,      \
-                                SaturateValue, false, false, ImplType)
-
-#define TL_DEFINE_MMA_DISPATCHER_WITH_FP4_SHIFT(                               \
-    ATypeEnum, BTypeEnum, CTypeEnum, MValue, NValue, KValue, TransAValue,      \
-    TransBValue, SaturateValue, ShiftAValue, ShiftBValue, ImplType)            \
-  TL_DEFINE_MMA_DISPATCHER_IMPL(                                               \
-      ATypeEnum, BTypeEnum, CTypeEnum, MValue, NValue, KValue, TransAValue,    \
-      TransBValue, SaturateValue, ShiftAValue, ShiftBValue, ImplType)
 
 // FP16 inputs (TN layout: A row-major, B column-major)
 TL_DEFINE_MMA_DISPATCHER(kFloat16, kFloat16, kFloat16, 16, 8, 16, false, true,
@@ -212,6 +229,16 @@ TL_DEFINE_MMA_DISPATCHER(kUInt4, kUInt4, kInt32, 16, 8, 32, false, true, false,
 TL_DEFINE_MMA_DISPATCHER(kUInt4, kUInt4, kInt32, 16, 8, 64, false, true, false,
                          cute::SM80_16x8x64_S32U4U4S32_TN)
 
+#if TL_HAS_SM120_MMA_DISPATCHER
+// FP4/F8F6F4 inputs (k32) for SM120
+TL_DEFINE_MMA_DISPATCHER(kFloat4_e2m1fn, kFloat4_e2m1fn, kFloat32, 16, 8, 32,
+                         false, true, false, tl::detail::SM120_FP4_FP4_F32_TN)
+TL_DEFINE_MMA_DISPATCHER(kFloat8_e4m3, kFloat4_e2m1fn, kFloat32, 16, 8, 32,
+                         false, true, false, tl::detail::SM120_FP8_FP4_F32_TN)
+TL_DEFINE_MMA_DISPATCHER(kFloat4_e2m1fn, kFloat8_e4m3, kFloat32, 16, 8, 32,
+                         false, true, false, tl::detail::SM120_FP4_FP8_F32_TN)
+#endif
+
 // FP8 inputs (k32)
 TL_DEFINE_MMA_DISPATCHER(kFloat8_e4m3, kFloat8_e4m3, kFloat16, 16, 8, 32, false,
                          true, false, cute::SM89_16x8x32_F16E4M3E4M3F16_TN)
@@ -243,26 +270,8 @@ TL_DEFINE_MMA_DISPATCHER(kTensorFloat32, kTensorFloat32, kFloat32, 16, 8, 8,
 TL_DEFINE_MMA_DISPATCHER(kFloat64, kFloat64, kFloat64, 8, 8, 4, false, true,
                          false, cute::SM80_8x8x4_F64F64F64F64_TN)
 
-// SM120 FP4/F8F6F4 inputs (k32)
-using SM120_FP4_FP4_F32_TN =
-    cute::SM120_16x8x32_TN<cute::float_e2m1_t, cute::float_e2m1_t, float>;
-using SM120_FP8_FP4_F32_TN =
-    cute::SM120_16x8x32_TN<cute::float_e4m3_t, cute::float_e2m1_t, float>;
-using SM120_FP4_FP8_F32_TN =
-    cute::SM120_16x8x32_TN<cute::float_e2m1_t, cute::float_e4m3_t, float>;
-TL_DEFINE_MMA_DISPATCHER_WITH_FP4_SHIFT(kFloat4_e2m1fn, kFloat4_e2m1fn,
-                                        kFloat32, 16, 8, 32, false, true, false,
-                                        true, true, SM120_FP4_FP4_F32_TN)
-TL_DEFINE_MMA_DISPATCHER_WITH_FP4_SHIFT(kFloat8_e4m3, kFloat4_e2m1fn, kFloat32,
-                                        16, 8, 32, false, true, false, false,
-                                        true, SM120_FP8_FP4_F32_TN)
-TL_DEFINE_MMA_DISPATCHER_WITH_FP4_SHIFT(kFloat4_e2m1fn, kFloat8_e4m3, kFloat32,
-                                        16, 8, 32, false, true, false, true,
-                                        false, SM120_FP4_FP8_F32_TN)
-
-#undef TL_DEFINE_MMA_DISPATCHER_WITH_FP4_SHIFT
 #undef TL_DEFINE_MMA_DISPATCHER
-#undef TL_DEFINE_MMA_DISPATCHER_IMPL
+#undef TL_HAS_SM120_MMA_DISPATCHER
 
 } // namespace detail
 

@@ -317,7 +317,7 @@ class TensorCoreIntrinEmitter:
             return i, j
 
         if not ldmatrix_available:
-            if a_dtype_bits in (4, 8):
+            if a_dtype_bits == 8 or is_fp4_a:
                 mma_load_layout = mma_load_a_32x16_to_shared_16x32_layout
             elif a_dtype_bits == 16:
                 mma_load_layout = mma_load_a_32x8_to_shared_16x16_layout
@@ -444,7 +444,7 @@ class TensorCoreIntrinEmitter:
             return i, j
 
         if not ldmatrix_available:
-            if b_dtype_bits in (4, 8):
+            if b_dtype_bits == 8 or is_fp4_b:
                 mma_load_layout = mma_load_b_32x16_to_shared_16x32_layout
             elif b_dtype_bits == 16:
                 mma_load_layout = mma_load_b_32x8_to_shared_16x16_layout
@@ -697,7 +697,9 @@ class TensorCoreIntrinEmitter:
         matrix_is_a: bool = matrix == "A"
         matrix_is_b: bool = matrix == "B"
         dtype = self.a_dtype if matrix_is_a else self.b_dtype
-        dtype_bits = DataType(dtype).bits
+        dtype_obj = DataType(dtype)
+        dtype_bits = dtype_obj.bits
+        is_fp4_e2m1fn = str(dtype_obj) == "float4_e2m1fn"
         transposed = self.a_transposed if matrix_is_a else self.b_transposed
 
         # s represents spatial axis
@@ -714,7 +716,7 @@ class TensorCoreIntrinEmitter:
         elif dtype_bits == 16:
             transform_func_sr_a = shared_16x16_to_mma_32x8_layout_sr_a
             transform_func_sr_b = shared_16x16_to_mma_32x8_layout_sr_b
-        elif dtype_bits in (4, 8):
+        elif dtype_bits == 8 or is_fp4_e2m1fn:
             transform_func_sr_a = shared_16x32_to_mma_32x16_layout_sr_a
             transform_func_sr_b = shared_16x32_to_mma_32x16_layout_sr_b
         else:

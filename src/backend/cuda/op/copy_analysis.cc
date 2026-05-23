@@ -275,18 +275,15 @@ bool CheckLDSMCopy(const CopyNode &op, Target target) {
       !IsFragmentBuffer(op.dst)) {
     return false;
   }
-  if (op.src->dtype.is_float4_e2m1fn() || op.dst->dtype.is_float4_e2m1fn()) {
-    return TargetIsSM120(target) && op.src->dtype == op.dst->dtype;
-  }
-  return true;
+  bool uses_fp4 =
+      op.src->dtype.is_float4_e2m1fn() || op.dst->dtype.is_float4_e2m1fn();
+  return !uses_fp4 || (TargetIsSM120(target) && op.src->dtype == op.dst->dtype);
 }
 
 bool CheckSTSMCopy(const CopyNode &op, Target target) {
-  if (op.src->dtype.is_float4_e2m1fn() || op.dst->dtype.is_float4_e2m1fn()) {
-    return false;
-  }
-  return TargetHasStmatrix(target) && IsFragmentBuffer(op.src) &&
-         IsSharedBuffer(op.dst);
+  return !op.src->dtype.is_float4_e2m1fn() &&
+         !op.dst->dtype.is_float4_e2m1fn() && TargetHasStmatrix(target) &&
+         IsFragmentBuffer(op.src) && IsSharedBuffer(op.dst);
 }
 
 bool CheckTMemLoad(const CopyNode &op, Target target) {

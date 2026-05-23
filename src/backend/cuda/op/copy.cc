@@ -1006,28 +1006,21 @@ Stmt Copy::LowerLDSM(const CopyNode &op, const LowerArgs &T,
 
   PrimExpr extent = local_tensor->shape[0];
   int num = 1;
-  if (is_fp4_ldmatrix) {
-    if (analyzer->CanProveEqual(FloorMod(extent, 16), 0))
-      num = 4;
-    else if (analyzer->CanProveEqual(FloorMod(extent, 8), 0))
-      num = 2;
-  } else {
-    if (analyzer->CanProveEqual(FloorMod(extent, 8), 0))
-      num = 4;
-    else if (analyzer->CanProveEqual(FloorMod(extent, 4), 0))
-      num = 2;
-  }
+  // FP4 b4x16 returns four logical elements per register; b16 returns two.
   int elems_per_reg = is_fp4_ldmatrix ? 4 : 2;
-  int elems_per_inst = elems_per_reg * num;
-  // FP4 b4x16 ldmatrix returns four logical FP4 elements per 32-bit register,
-  // while the existing b16 path returns two 16-bit elements per register.
-
+  int max_elems_per_inst = elems_per_reg * 4;
+  int mid_elems_per_inst = elems_per_reg * 2;
   PrimExpr flattened_indice = shared_tensor.OffsetOf(shared_indices).back();
   if (!IndicesCanVectorize(flattened_indice, loop_vars.back()->var,
-                           loop_vars.back()->dom->extent, elems_per_inst,
+                           loop_vars.back()->dom->extent, max_elems_per_inst,
                            analyzer)) {
     return LowerNormal(op, T, analyzer);
   }
+  if (analyzer->CanProveEqual(FloorMod(extent, max_elems_per_inst), 0))
+    num = 4;
+  else if (analyzer->CanProveEqual(FloorMod(extent, mid_elems_per_inst), 0))
+    num = 2;
+  int elems_per_inst = elems_per_reg * num;
 
   for (size_t i = 0; i < dst_range.size(); i++) {
     if (!is_zero(dst_range[i]->min) ||

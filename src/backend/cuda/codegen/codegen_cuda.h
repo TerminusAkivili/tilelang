@@ -82,7 +82,9 @@ private:
                            std::ostream &os) final;
   bool HandleLateIntrinsicCall(const CallNode *op, std::ostream &os);
   // FP4 address helpers distinguish packed global storage from SM120 padded
-  // shared storage; local fragments remain semantic FP4 arrays.
+  // shared storage; local fragments remain semantic FP4 arrays. Codegen picks
+  // packed access by storage scope instead of keeping a second packed name map.
+  std::string GetBufferStorageScope(const VarNode *buffer_var) const;
   bool IsFp4PackedStorage(const VarNode *buffer_var,
                           DataType element_dtype) const;
   bool IsFp4PaddedSharedStorage(const VarNode *buffer_var,
@@ -90,6 +92,8 @@ private:
   bool IsFp4SemanticLocalStorage(const VarNode *buffer_var,
                                  DataType element_dtype) const;
   PrimExpr GetFp4PaddedSharedIndex(PrimExpr index) const;
+  bool TryPrintFp4PaddedCPAsync(const CallNode *op, int num_segments,
+                                bool *matched_padded_copy);
 
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
   bool IsScopePartOfType() const final { return false; }
@@ -164,6 +168,8 @@ private:
   std::unordered_map<const VarNode *, std::string> fragment_layouts;
   std::unordered_map<const VarNode *, IntImm> unroll_factor;
   std::optional<std::tuple<int64_t, int64_t, int64_t>> cluster_dims;
+  // FP4 packed storage is tracked by buffer scope helpers instead of a
+  // separate packed-buffer variable-name map.
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangCUDA *p);
   void PrintWmmaScope(const std::string &scope, DataType t,
