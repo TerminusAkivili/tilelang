@@ -1782,6 +1782,32 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocBufferNode *op) {
   RegisterHandleType_(op->buffer->data.get(), alloc_dtype);
 }
 
+void CodeGenTileLangCuTeDSL::VisitStmt_(const BindNode *op) {
+  const auto *call = op->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::handle_add_byte_offset())) {
+    CodeGenTileLangPY::VisitStmt_(op);
+    return;
+  }
+
+  ICHECK_EQ(call->args.size(), 2U);
+  const auto *ptr = op->var->type_annotation.as<PointerTypeNode>();
+  ICHECK(ptr) << "handle_add_byte_offset alias must bind a pointer var";
+  const auto *prim = ptr->element_type.as<PrimTypeNode>();
+  ICHECK(prim) << "handle_add_byte_offset alias must have a primitive dtype";
+
+  const auto *base_var = call->args[0].as<VarNode>();
+  ICHECK(base_var == nullptr || HandleTypeMatch_(base_var, DataType::UInt(8)))
+      << "CuTeDSL byte-offset aliases must be based on a uint8 arena";
+
+  PrintIndent();
+  stream << AllocVarID(op->var.get()) << " = tl.make_tensor(tl.recast_ptr("
+         << GetVarPtr_(call->args[0]) << " + " << PrintExpr_(call->args[1])
+         << ", dtype=";
+  PrintType(prim->dtype, stream);
+  stream << "), (1,))\n";
+  RegisterHandleType_(op->var.get(), prim->dtype);
+}
+
 void CodeGenTileLangCuTeDSL::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == tirx::attr::thread_extent) {
     IterVar iv = Downcast<IterVar>(op->node);

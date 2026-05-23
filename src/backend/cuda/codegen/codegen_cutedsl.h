@@ -46,6 +46,7 @@ protected:
 
   void VisitStmt_(const BufferStoreNode *op) override;
   void VisitStmt_(const AllocBufferNode *op) override;
+  void VisitStmt_(const BindNode *op) override;
   void VisitStmt_(const AttrStmtNode *op) override;
   void VisitStmt_(const ForNode *op) override;
   void VisitStmt_(const IfThenElseNode *op) override;
