@@ -12,6 +12,7 @@ from tvm.ir import Range
 from tvm import tirx
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
+from tilelang.utils.target import target_is_sm120
 
 
 GEMM_INST_MMA = "cuda.mma"
@@ -41,6 +42,18 @@ class GemmMMA(GemmBase):
         if not mixed_fp8_fp4:
             raise AssertionError(f"Unsupported mixed MMA dtypes: A={a_dtype}, B={b_dtype}")
 
+    def _use_sm120_fp4_byte_carrier_layout(self, target: Target) -> bool:
+        if not target_is_sm120(target):
+            return False
+        return self._is_fp4_e2m1(str(self.A.dtype)) or self._is_fp4_e2m1(str(self.B.dtype))
+
+    def _make_mma_shared_layout(self, buffer: tirx.Buffer, use_byte_carrier: bool):
+        # SM120 FP4 MMA can use a byte-container shared layout while keeping
+        # the public GEMM dtype semantic.
+        if use_byte_carrier and self._is_fp4_e2m1(str(buffer.dtype)):
+            buffer = tirx.decl_buffer(buffer.shape, "uint8", scope=buffer.scope())
+        return make_swizzled_layout(buffer)
+
     def _make_mma_emitter(self, target: Target, thread_nums: int, thread_var: tirx.Var | None = None):
         self._validate_mma_dtypes()
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_INST_MMA)
@@ -68,22 +81,23 @@ class GemmMMA(GemmBase):
 
     def infer_layout(self, target: Target, thread_nums: int):
         mma_emitter = self._make_mma_emitter(target, thread_nums)
+        use_byte_carrier = self._use_sm120_fp4_byte_carrier_layout(target)
         if self.is_gemm_ss():
             return {
-                self.A: make_swizzled_layout(self.A),
-                self.B: make_swizzled_layout(self.B),
+                self.A: self._make_mma_shared_layout(self.A, use_byte_carrier),
+                self.B: self._make_mma_shared_layout(self.B, use_byte_carrier),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_sr():
             return {
-                self.A: make_swizzled_layout(self.A),
+                self.A: self._make_mma_shared_layout(self.A, use_byte_carrier),
                 self.B: mma_emitter.make_mma_load_layout(self.B, matrix="B"),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_rs():
             return {
                 self.A: mma_emitter.make_mma_load_layout(self.A, matrix="A"),
-                self.B: make_swizzled_layout(self.B),
+                self.B: self._make_mma_shared_layout(self.B, use_byte_carrier),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_rr():

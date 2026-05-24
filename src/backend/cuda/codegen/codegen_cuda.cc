@@ -22,6 +22,7 @@
 #include "arith/pattern_match.h"
 #include "backend/cuda/codegen/ptx.h"
 #include "op/builtin.h"
+#include "op/packed_lowbit.h"
 #include "target/utils.h"
 #include "transform/common/attr.h"
 
@@ -60,39 +61,21 @@ std::optional<DataType> GetAccessPtrElementType(const PrimExpr &expr) {
   return std::nullopt;
 }
 
-int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
-  ICHECK(op->args.size() == 3 || op->args.size() == 4)
-      << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-         "src_access_ptr, num_elems, [predicate])";
-  const auto *num_elems_imm = op->args[2].as<IntImmNode>();
-  ICHECK(num_elems_imm) << "tl::ptx_cp_async num_elems must be IntImm, but got "
-                        << op->args[2];
-  int64_t num_elems = num_elems_imm->value;
-  ICHECK_GT(num_elems, 0);
-
-  auto dst_elem_type = GetAccessPtrElementType(op->args[0]);
-  auto src_elem_type = GetAccessPtrElementType(op->args[1]);
-  ICHECK(dst_elem_type.has_value() && src_elem_type.has_value())
-      << "tl::ptx_cp_async expects address_of, tl.access_ptr, or "
-         "tvm_access_ptr operands";
-
-  int64_t dst_total_bits =
-      num_elems * dst_elem_type.value().bits() * dst_elem_type.value().lanes();
-  int64_t src_total_bits =
-      num_elems * src_elem_type.value().bits() * src_elem_type.value().lanes();
-  ICHECK_EQ(dst_total_bits, src_total_bits)
-      << "tl::ptx_cp_async requires src/dst transfer widths to match, but got "
-      << dst_total_bits << " vs " << src_total_bits << " bits";
-  ICHECK_EQ(dst_total_bits % 8, 0)
-      << "tl::ptx_cp_async requires byte-aligned transfers, but got "
-      << dst_total_bits << " bits";
-
-  int64_t total_bytes = dst_total_bits / 8;
-  ICHECK(IsValidCPAsyncTransferBytes(total_bytes))
-      << "tl::ptx_cp_async requires a final PTX byte width in {4, 8, 16}, but "
-         "got "
-      << total_bytes;
-  return static_cast<int>(total_bytes);
+const BufferLoadNode *GetAccessPtrBufferLoad(const PrimExpr &expr) {
+  const auto *ptr_call = expr.as<CallNode>();
+  if (ptr_call == nullptr) {
+    return nullptr;
+  }
+  if (ptr_call->op.same_as(builtin::address_of())) {
+    ICHECK(!ptr_call->args.empty());
+    return ptr_call->args[0].as<BufferLoadNode>();
+  }
+  if (ptr_call->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(ptr_call->args.size(), 3U)
+        << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
+    return ptr_call->args[0].as<BufferLoadNode>();
+  }
+  return nullptr;
 }
 
 bool CanEmitPackedX2Math(DataType t) {
@@ -1974,9 +1957,14 @@ std::string CodeGenTileLangCUDA::GetVecLoad(DataType t,
     os << ")";
     return os.str();
   };
-  if (IsFp4SemanticLocalStorage(buffer_var, buffer->dtype) &&
+  bool fp4_one_element_per_slot =
+      IsFp4SemanticLocalStorage(buffer_var, buffer->dtype) ||
+      IsFp4ByteCarrierSharedStorage(buffer_var, buffer->dtype);
+  if (fp4_one_element_per_slot &&
       t.is_float4_e2m1fn() && t.lanes() > 1) {
-    // Local FP4 vectors are logical element arrays, not packed byte arrays.
+    // Local FP4 and SM120 byte-carrier shared FP4 expose one logical element
+    // per slot; rebuild vector values lane-by-lane instead of using packed
+    // byte reinterpretation.
     return make_fp4_vec([&](int i) {
       PrimExpr index = arith::Analyzer().Simplify(
           base + IntImm(base.dtype(), static_cast<int64_t>(i)));
@@ -2033,9 +2021,7 @@ std::string CodeGenTileLangCUDA::GetVecLoad(DataType t,
       t.lanes() > 1) {
     arith::Analyzer analyzer;
     bool base_aligned = is_zero(analyzer.Simplify(truncmod(base, 2)));
-    if (!base_aligned) {
-      // Packed FP4 vector reinterpret is only nibble-aligned for even logical
-      // bases. Odd or symbolic bases need per-lane nibble selection.
+    auto print_scalar_load = [&]() {
       std::string vid = GetVarID(buffer_var);
       return make_fp4_vec([&](int i) {
         PrimExpr index = analyzer.Simplify(
@@ -2043,6 +2029,29 @@ std::string CodeGenTileLangCUDA::GetVecLoad(DataType t,
         return "tl_fp4_packed_load((fp4_e2_2_t*)" + vid + ", " +
                PrintExpr(index) + ")";
       });
+    };
+    if (!base_aligned) {
+      // Packed FP4 vector reinterpret is only nibble-aligned for even logical
+      // bases. Odd or symbolic bases need per-lane nibble selection.
+      return print_scalar_load();
+    }
+
+    std::string scope = GetBufferStorageScope(buffer_var);
+    if (scope.empty()) {
+      scope = GetPtrStorageScope(buffer->data);
+    }
+    if (scope == "global" && t.lanes() == 16) {
+      bool base_16_aligned = is_zero(analyzer.Simplify(truncmod(base, 16)));
+      if (!base_16_aligned) {
+        return print_scalar_load();
+      }
+      // When the source remains packed global FP4, expand the loaded segment
+      // into the SM120 byte-carrier shared representation before ldmatrix/MMA.
+      PrimExpr byte_base = analyzer.Simplify(truncdiv(base, 2));
+      std::ostringstream os;
+      os << "tl_fp4_load_packed_16(" << GetVarID(buffer_var) << " + "
+         << PrintExpr(byte_base) << ")";
+      return os.str();
     }
   }
 
@@ -2087,6 +2096,31 @@ void CodeGenTileLangCUDA::PrintVecStore(const BufferNode *buffer, DataType t,
       PrimExpr index = arith::Analyzer().Simplify(
           base + IntImm(base.dtype(), static_cast<int64_t>(i)));
       this->stream << vid << "[" << PrintExpr(index) << "] = " << elem << "; ";
+    });
+    return;
+  }
+
+  if (IsFp4ByteCarrierSharedStorage(buffer_var, buffer->dtype) &&
+      t.is_float4_e2m1fn() && t.lanes() > 1) {
+    // Byte-carrier shared FP4 stores the low nibble of each semantic FP4
+    // element in its own byte, matching the ordinary SM120 ldmatrix layout.
+    std::string vid = GetVarID(buffer_var);
+    if (t.lanes() == 16) {
+      arith::Analyzer analyzer;
+      bool base_16_aligned = is_zero(analyzer.Simplify(truncmod(base, 16)));
+      if (base_16_aligned) {
+        this->PrintIndent();
+        this->stream << "*(uint4*)((uint8_t*)" << vid << " + "
+                     << PrintExpr(base) << ") = tl_fp4_unpack_16_to_bytes("
+                     << value << ");\n";
+        return;
+      }
+    }
+    emit_fp4_vec_scope([&](int i, const std::string &elem) {
+      PrimExpr index = arith::Analyzer().Simplify(
+          base + IntImm(base.dtype(), static_cast<int64_t>(i)));
+      this->stream << vid << "[" << PrintExpr(index) << "] = (" << elem
+                   << ").__x; ";
     });
     return;
   }
@@ -2167,9 +2201,11 @@ void CodeGenTileLangCUDA::PrintVecStore(const BufferNode *buffer, DataType t,
                << ");\n";
 }
 
-// FP4 has three storage cases:
-// - Global buffers use packed bytes.
-// - SM120 shared buffers use packed bytes plus b4x16 padded rows.
+// FP4 storage is policy-driven:
+// - Default global buffers use packed bytes.
+// - SM120 byte-carrier global/shared buffers use one byte per logical FP4
+//   element when the buffer is explicitly marked by policy.
+// - SM120 padded shared buffers keep the b4x16 row layout.
 // - Local/local.fragment buffers use semantic FP4 elements for MMA operands.
 std::string
 CodeGenTileLangCUDA::GetBufferStorageScope(const VarNode *buffer_var) const {
@@ -2181,9 +2217,42 @@ CodeGenTileLangCUDA::GetBufferStorageScope(const VarNode *buffer_var) const {
   return "";
 }
 
+bool CodeGenTileLangCUDA::IsSM120Fp4ByteCarrierBuffer(
+    const VarNode *buffer_var) const {
+  return sm120_fp4_byte_carrier_buffers_.count(buffer_var->name_hint) != 0;
+}
+
+DataType CodeGenTileLangCUDA::GetHandleStorageType(
+    const VarNode *buffer_var, DataType element_dtype) const {
+  return element_dtype.is_float4_e2m1fn() &&
+                 IsSM120Fp4ByteCarrierBuffer(buffer_var)
+             ? DataType::UInt(8)
+             : element_dtype;
+}
+
+void CodeGenTileLangCUDA::PrintHandleTypeAndRegister(const tirx::Var &var,
+                                                     std::ostream &os) {
+  if (auto *ptr = var->type_annotation.as<PointerTypeNode>()) {
+    if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+      DataType storage_type = GetHandleStorageType(var.get(), prim->dtype);
+      if (storage_type == prim->dtype) {
+        CodeGenC::PrintType(GetType(var), os);
+      } else {
+        CodeGenC::PrintType(PointerType(PrimType(storage_type)), os);
+      }
+      RegisterHandleType(var.get(), storage_type);
+      return;
+    }
+  }
+  CodeGenC::PrintType(GetType(var), os);
+}
+
 bool CodeGenTileLangCUDA::IsFp4PackedStorage(const VarNode *buffer_var,
                                              DataType element_dtype) const {
   if (!element_dtype.is_float4_e2m1fn() || !element_dtype.is_scalar()) {
+    return false;
+  }
+  if (IsFp4ByteCarrierStorage(buffer_var, element_dtype)) {
     return false;
   }
 
@@ -2196,12 +2265,48 @@ bool CodeGenTileLangCUDA::IsFp4PackedStorage(const VarNode *buffer_var,
   }
   if (scope == "shared" || scope == "shared.dyn") {
     // Pre-SM120 shared FP4 keeps the packed-byte convention. SM120 shared FP4
-    // is handled by IsFp4PaddedSharedStorage so b4x16 row padding is preserved.
+    // is handled by the byte-carrier layout or the older padded shared
+    // predicate.
     Target cur_target = Target::Current(/*allow_not_defined=*/true);
     return cur_target.defined() && tl::TargetHasSMVersionGE(cur_target, 100) &&
            !tl::TargetHasSMVersionGE(cur_target, 120);
   }
   return scope != "local" && scope != "local.var" && scope != "local.fragment";
+}
+
+bool CodeGenTileLangCUDA::IsFp4ByteCarrierStorage(
+    const VarNode *buffer_var, DataType element_dtype) const {
+  if (!element_dtype.is_float4_e2m1fn() || !element_dtype.is_scalar()) {
+    return false;
+  }
+
+  std::string scope = GetBufferStorageScope(buffer_var);
+  Target cur_target = Target::Current(/*allow_not_defined=*/true);
+  if (!cur_target.defined() || !tl::TargetHasSMVersionGE(cur_target, 120)) {
+    return false;
+  }
+  if (scope == "shared" || scope == "shared.dyn") {
+    // Shared aliases may be introduced after device splitting, so they do not
+    // always appear in the function-level buffer-name policy. Once an SM120 FP4
+    // MMA path is selected, every semantic FP4 shared operand uses the internal
+    // byte-container layout.
+    return !sm120_fp4_byte_carrier_buffers_.empty();
+  }
+  if (scope.empty() || scope == "global") {
+    // Global parameters remain opt-in by name so ordinary semantic FP4 storage
+    // outside the SM120 byte-carrier policy keeps the packed ABI.
+    return IsSM120Fp4ByteCarrierBuffer(buffer_var);
+  }
+  return false;
+}
+
+bool CodeGenTileLangCUDA::IsFp4ByteCarrierSharedStorage(
+    const VarNode *buffer_var, DataType element_dtype) const {
+  if (!IsFp4ByteCarrierStorage(buffer_var, element_dtype)) {
+    return false;
+  }
+  std::string scope = GetBufferStorageScope(buffer_var);
+  return scope == "shared" || scope == "shared.dyn";
 }
 
 bool CodeGenTileLangCUDA::IsFp4PaddedSharedStorage(
@@ -2212,6 +2317,9 @@ bool CodeGenTileLangCUDA::IsFp4PaddedSharedStorage(
 
   std::string scope = GetBufferStorageScope(buffer_var);
   if (scope != "shared" && scope != "shared.dyn") {
+    return false;
+  }
+  if (IsFp4ByteCarrierSharedStorage(buffer_var, element_dtype)) {
     return false;
   }
   // SM120 b4x16 ldmatrix requires a padded shared-memory row layout.
@@ -2232,6 +2340,73 @@ bool CodeGenTileLangCUDA::IsFp4SemanticLocalStorage(
 PrimExpr CodeGenTileLangCUDA::GetFp4PaddedSharedIndex(PrimExpr index) const {
   arith::Analyzer analyzer;
   return analyzer.Simplify(truncdiv(index, 16) * 32 + truncmod(index, 16));
+}
+
+int CodeGenTileLangCUDA::GetAccessPtrElementBits(
+    const PrimExpr &expr) const {
+  auto elem_type = GetAccessPtrElementType(expr);
+  ICHECK(elem_type.has_value())
+      << "tl::ptx_cp_async expects address_of, tl.access_ptr, or "
+         "tvm_access_ptr operands";
+  if (!elem_type->is_float4_e2m1fn()) {
+    return elem_type->bits();
+  }
+
+  if (const BufferLoadNode *load = GetAccessPtrBufferLoad(expr)) {
+    if (IsFp4ByteCarrierStorage(load->buffer->data.get(),
+                                load->buffer->dtype)) {
+      return 8;
+    }
+    return elem_type->bits();
+  }
+
+  const auto *ptr_call = expr.as<CallNode>();
+  if (ptr_call != nullptr && ptr_call->op.same_as(builtin::tvm_access_ptr()) &&
+      ptr_call->args.size() >= 2U) {
+    if (const auto *var = ptr_call->args[1].as<VarNode>()) {
+      if (IsFp4ByteCarrierStorage(var, elem_type->element_of())) {
+        return 8;
+      }
+    }
+  }
+  return elem_type->bits();
+}
+
+int CodeGenTileLangCUDA::GetTileLangCPAsyncTransferBytes(
+    const CallNode *op) const {
+  ICHECK(op->args.size() == 3 || op->args.size() == 4)
+      << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+         "src_access_ptr, num_elems, [predicate])";
+  const auto *num_elems_imm = op->args[2].as<IntImmNode>();
+  ICHECK(num_elems_imm) << "tl::ptx_cp_async num_elems must be IntImm, but got "
+                        << op->args[2];
+  int64_t num_elems = num_elems_imm->value;
+  ICHECK_GT(num_elems, 0);
+
+  auto dst_elem_type = GetAccessPtrElementType(op->args[0]);
+  auto src_elem_type = GetAccessPtrElementType(op->args[1]);
+  ICHECK(dst_elem_type.has_value() && src_elem_type.has_value())
+      << "tl::ptx_cp_async expects address_of, tl.access_ptr, or "
+         "tvm_access_ptr operands";
+  int64_t dst_total_bits =
+      num_elems * GetAccessPtrElementBits(op->args[0]) *
+      dst_elem_type.value().lanes();
+  int64_t src_total_bits =
+      num_elems * GetAccessPtrElementBits(op->args[1]) *
+      src_elem_type.value().lanes();
+  ICHECK_EQ(dst_total_bits, src_total_bits)
+      << "tl::ptx_cp_async requires src/dst transfer widths to match, but got "
+      << dst_total_bits << " vs " << src_total_bits << " bits";
+  ICHECK_EQ(dst_total_bits % 8, 0)
+      << "tl::ptx_cp_async requires byte-aligned transfers, but got "
+      << dst_total_bits << " bits";
+
+  int64_t total_bytes = dst_total_bits / 8;
+  ICHECK(IsValidCPAsyncTransferBytes(total_bytes))
+      << "tl::ptx_cp_async requires a final PTX byte width in {4, 8, 16}, but "
+         "got "
+      << total_bytes;
+  return static_cast<int>(total_bytes);
 }
 
 bool CodeGenTileLangCUDA::TryPrintFp4PaddedCPAsync(const CallNode *op,
@@ -2709,8 +2884,13 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto dst_elem_type = GetAccessPtrElementType(op->args[3]);
     bool is_fp4_ldmatrix =
         dst_elem_type.has_value() && dst_elem_type->is_float4_e2m1fn();
+    const BufferLoadNode *src_load = GetAccessPtrBufferLoad(op->args[2]);
+    bool is_byte_carrier_fp4_ldmatrix =
+        is_fp4_ldmatrix && src_load != nullptr &&
+        IsFp4ByteCarrierSharedStorage(src_load->buffer->data.get(),
+                                      src_load->buffer->dtype);
     std::string func_name;
-    if (is_fp4_ldmatrix) {
+    if (is_fp4_ldmatrix && !is_byte_carrier_fp4_ldmatrix) {
       Target cur_target = Target::Current(/*allow_not_defined=*/true);
       ICHECK(cur_target.defined() && tl::TargetHasSMVersionGE(cur_target, 120))
           << "SM120 b4x16 ldmatrix requires SM120+";
@@ -2735,6 +2915,9 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintIndent();
       this->stream << func_name << "(" << src_ptr << ", " << dst_ptr << ");\n";
     } else {
+      if (is_fp4_ldmatrix) {
+        enable_fp4_ = true;
+      }
       func_name = "tl::ptx_ldmatrix_x" + std::to_string(num);
       if (trans == 1)
         func_name += "_trans";
@@ -3711,6 +3894,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     bool is_packed_int4 =
         op->dtype.bits() == 4 && (op->dtype.is_int() || op->dtype.is_uint());
     bool is_fp4_ldmatrix = op->dtype.is_float4_e2m1fn();
+    bool is_byte_carrier_fp4_ldmatrix = false;
     PrimExpr local_elem_offset_expr = op->args[4];
     if (is_packed_int4) {
       local_elem_offset_expr =
@@ -3739,7 +3923,12 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       }
       std::string smem_elem_offset = this->PrintExpr(smem_elem_offset_expr);
       std::string func_name;
-      if (is_fp4_ldmatrix) {
+      if (const auto *smem_var = op->args[5].as<VarNode>()) {
+        is_byte_carrier_fp4_ldmatrix =
+            is_fp4_ldmatrix &&
+            IsFp4ByteCarrierSharedStorage(smem_var, op->dtype);
+      }
+      if (is_fp4_ldmatrix && !is_byte_carrier_fp4_ldmatrix) {
         Target cur_target = Target::Current(/*allow_not_defined=*/true);
         ICHECK(cur_target.defined() &&
                tl::TargetHasSMVersionGE(cur_target, 120))
@@ -3748,6 +3937,9 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
         enable_fp4_ = true;
         func_name = "tl::ptx_ldmatrix_b4x16_x" + std::to_string(num);
       } else {
+        if (is_fp4_ldmatrix) {
+          enable_fp4_ = true;
+        }
         func_name = "tl::ptx_ldmatrix_x" + std::to_string(num);
       }
       if (trans == 1 && !is_fp4_ldmatrix)
@@ -5008,14 +5200,25 @@ void CodeGenTileLangCUDA::VisitStmt_(const BufferStoreNode *op) {
   }
 
   if (value_dtype.lanes() == element_dtype.lanes()) {
-    // Scalar FP4 packed/padded stores update one nibble at the logical index.
-    // A plain assignment to the backing byte would overwrite the neighboring
-    // element; SM120 shared memory first applies the b4x16 padded-row layout.
-    bool fp4_padded = IsFp4PaddedSharedStorage(buffer_var.get(), element_dtype);
-    if (fp4_padded || IsFp4PackedStorage(buffer_var.get(), element_dtype)) {
-      PrimExpr fp4_index =
-          fp4_padded ? GetFp4PaddedSharedIndex(index_expr) : index_expr;
-      std::string idx_str = PrintExpr(fp4_index);
+    // Scalar FP4 stores update one nibble at the logical index. A plain
+    // assignment to the backing byte would overwrite the neighboring element;
+    // SM120 shared memory first applies the b4x16 padded-row layout.
+    if (IsFp4PaddedSharedStorage(buffer_var.get(), element_dtype)) {
+      std::string idx_str = PrintExpr(GetFp4PaddedSharedIndex(index_expr));
+      std::string value = this->PrintExpr(op->value);
+      std::string vid = GetVarID(buffer_var.get());
+      this->PrintIndent();
+      stream << "tl_fp4_packed_store((fp4_e2_2_t*)" << vid << ", " << idx_str
+             << ", " << value << ");\n";
+    } else if (IsFp4ByteCarrierSharedStorage(buffer_var.get(),
+                                             element_dtype)) {
+      std::string idx_str = PrintExpr(index_expr);
+      std::string value = this->PrintExpr(op->value);
+      std::string vid = GetVarID(buffer_var.get());
+      this->PrintIndent();
+      stream << vid << "[" << idx_str << "] = (" << value << ").__x;\n";
+    } else if (IsFp4PackedStorage(buffer_var.get(), element_dtype)) {
+      std::string idx_str = PrintExpr(index_expr);
       std::string value = this->PrintExpr(op->value);
       std::string vid = GetVarID(buffer_var.get());
       this->PrintIndent();
@@ -5700,12 +5903,7 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
       if (ro_param_indices.count(static_cast<int>(i))) {
         os << "const ";
       }
-      CodeGenC::PrintType(GetType(v), os);
-      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-        if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-          RegisterHandleType(v.get(), prim->dtype);
-        }
-      }
+      PrintHandleTypeAndRegister(v, os);
 
       if (!has_cuda_pdl_sync && no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, os);
@@ -5723,7 +5921,8 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
   for (const auto &param : func->params) {
     if (auto *ptr = param->type_annotation.as<PointerTypeNode>()) {
       if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-        RegisterHandleType(param.get(), prim->dtype);
+        RegisterHandleType(param.get(),
+                           GetHandleStorageType(param.get(), prim->dtype));
       }
     }
   }
@@ -5747,11 +5946,16 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
     return;
   }
 
-  // If the function has already been forward-declared, this is a
-  // no-op.
+  sm120_fp4_byte_carrier_buffers_ =
+      tl::packed_lowbit::GetByteCarrierBuffers(f);
+  // If the function has already been forward-declared, this is a no-op. The
+  // byte-carrier policy must be initialized first so declarations and
+  // definitions agree on SM120 FP4 operand pointer types.
   CodeGenC::DeclareFunction(gvar, f);
   // clear previous generated state.
   this->InitFuncState(f);
+  sm120_fp4_byte_carrier_buffers_ =
+      tl::packed_lowbit::GetByteCarrierBuffers(f);
   // reserve keywords
   ReserveKeywordsAsUnique_();
 
@@ -5809,12 +6013,7 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
       if (ro_param_indices.count(static_cast<int>(i))) {
         stream << "const ";
       }
-      CodeGenC::PrintType(GetType(v), stream);
-      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-        if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-          RegisterHandleType(v.get(), prim->dtype);
-        }
-      }
+      PrintHandleTypeAndRegister(v, stream);
 
       if (!has_cuda_pdl_sync && no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, stream);

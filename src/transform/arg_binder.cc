@@ -356,9 +356,15 @@ void ArgBinder::BindDLTensors(
     const PrimExpr &device_type, const PrimExpr &device_id,
     const std::string &func_name,
     const std::unordered_set<const VarNode *> &used_param_buffers,
-    const std::unordered_set<const VarNode *> &used_shape_vars) {
+    const std::unordered_set<const VarNode *> &used_shape_vars,
+    const std::unordered_set<std::string> &byte_carrier_buffers) {
   Array<Buffer> buffers;
   Array<Var> handles;
+  auto is_byte_carrier_fp4_buffer = [&](const Buffer &buffer) {
+    return buffer.defined() && buffer->dtype.is_float4_e2m1fn() &&
+           (byte_carrier_buffers.count(buffer->data->name_hint) != 0 ||
+            byte_carrier_buffers.count(buffer->name) != 0);
+  };
 
   // First pass: collect shape var -> list of (buffer_name, dim_idx, handle_ptr)
   struct ShapeVarSource {
@@ -374,7 +380,7 @@ void ArgBinder::BindDLTensors(
 
     // Scan buffer shape for symbolic variables
     for (size_t k = 0; k < buffer->shape.size(); ++k) {
-      if (buffer->dtype.bits() < 8) {
+      if (buffer->dtype.bits() < 8 && !is_byte_carrier_fp4_buffer(buffer)) {
         break;
       }
 
@@ -517,6 +523,14 @@ void ArgBinder::BindDLTensors(
     PrimExpr cond = (v_type_code == expect_code && v_type_bits == expect_bits &&
                      v_type_lanes == expect_lanes);
 
+    if (is_byte_carrier_fp4_buffer(buffer)) {
+      PrimExpr code_uint = IntImm(DataType::UInt(8), DataType::kUInt);
+      PrimExpr bits8 = IntImm(DataType::UInt(8), 8);
+      PrimExpr lanes1 = IntImm(DataType::UInt(16), 1);
+      cond = cond || (v_type_code == code_uint && v_type_bits == bits8 &&
+                      v_type_lanes == lanes1);
+    }
+
     // Allow float8_e4m3 to match float8_e4m3fn/float8_e4m3fnuz at runtime.
     if (buffer->dtype.is_float8_e4m3()) {
       PrimExpr code_e4m3 = IntImm(DataType::UInt(8), DataType::kFloat8_e4m3);
@@ -575,7 +589,8 @@ void ArgBinder::BindDLTensors(
     }
     // Allow with bits < 8 to match any type with the same total bit count at
     // runtime (PyTorch uses int8 as storage for FP4).
-    bool data_is_subtype = buffer->dtype.bits() < 8;
+    bool data_is_subtype =
+        buffer->dtype.bits() < 8 && !is_byte_carrier_fp4_buffer(buffer);
     if (data_is_subtype) {
       // Get the pre-created shape buffer for reading runtime shape
       Buffer buf_shape = shape_buffer_map[arg_name];
@@ -1006,7 +1021,8 @@ void ArgBinder::BindDLTensors(
     }
 
     // Byte_offset field.
-    int data_bytes = GetVectorBytes(buffer->dtype);
+    int data_bytes =
+        is_byte_carrier_fp4_buffer(buffer) ? 1 : GetVectorBytes(buffer->dtype);
 
     if (const auto *const_offset = buffer->elem_offset.as<IntImmNode>()) {
       // Constant elem_offset: only need consistency check, no need for
@@ -1131,7 +1147,10 @@ void ArgBinder::BindDLTensors(
           AttrStmt(vptr, tirx::attr::storage_alignment,
                    IntImm(DataType::Int(32), buffer->data_alignment), nop));
 
-      def_handle_dtype_.Set(vptr, tirx::TypeAnnotation(buffer->dtype));
+      DataType handle_dtype = is_byte_carrier_fp4_buffer(buffer)
+                                  ? DataType::UInt(8)
+                                  : buffer->dtype;
+      def_handle_dtype_.Set(vptr, tirx::TypeAnnotation(handle_dtype));
     }
   }
 }

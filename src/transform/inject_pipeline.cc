@@ -28,6 +28,7 @@
 #include "../op/copy.h"
 #include "../op/gemm.h"
 #include "../op/operator.h"
+#include "../op/packed_lowbit.h"
 #include "../op/region.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
@@ -427,9 +428,17 @@ private:
     }
     // Tile-op copies lower through copy.cc, so they need an explicit
     // per-copy marker to suppress their own implicit commit/wait.
+    TileOperator tile_op = ParseOperator(call);
+    const auto *copy = tile_op.as<CopyNode>();
+    ICHECK(copy != nullptr);
     auto annotations = call->annotations;
     annotations.Set(attr::kAsyncCopyNoImplicitCommitWait,
                     IntImm(DataType::Int(32), 1));
+    if (target_.defined() &&
+        packed_lowbit::IsSM120Fp4GlobalToSharedCopy(*copy, target_.value())) {
+      annotations.Set(packed_lowbit::kByteCarrierCopyAttr,
+                      IntImm(DataType::Int(32), 1));
+    }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 

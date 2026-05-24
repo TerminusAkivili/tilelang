@@ -117,7 +117,8 @@ public:
                 const PrimExpr &device_type, const PrimExpr &device_id,
                 const std::string &func_name,
                 const std::unordered_set<const VarNode *> &used_param_buffers,
-                const std::unordered_set<const VarNode *> &used_shape_vars);
+                const std::unordered_set<const VarNode *> &used_shape_vars,
+                const std::unordered_set<std::string> &byte_carrier_buffers);
 
   /*! \return The defs generated in binding. */
   const std::vector<Var> &defs() const { return defs_; }

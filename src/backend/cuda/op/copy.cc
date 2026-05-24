@@ -12,6 +12,7 @@
 #include "backend/cuda/op/copy.h"
 #include "layout/tcgen05_layout.h"
 #include "op/builtin.h"
+#include "op/packed_lowbit.h"
 #include "op/utils.h"
 #include "target/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -648,9 +649,7 @@ Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
   }
 
   bool fp4_padded_shared_copy =
-      TargetIsSM120(T.target) && IsGlobalBuffer(op.src) &&
-      IsSharedBuffer(op.dst) && op.src->dtype.is_float4_e2m1fn() &&
-      op.dst->dtype.is_float4_e2m1fn();
+      packed_lowbit::RequiresSM120Fp4PackedLowbitCopy(op, T.target);
 
   auto simt_loop = op.MakeSIMTLoop(analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));

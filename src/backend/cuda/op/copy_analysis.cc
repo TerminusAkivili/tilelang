@@ -9,6 +9,7 @@
 #include <tvm/runtime/logging.h>
 
 #include "op/builtin.h"
+#include "op/packed_lowbit.h"
 #include "op/utils.h"
 #include "target/utils.h"
 
@@ -139,6 +140,9 @@ bool CheckBulkLoad(const CopyNode &op, Target target, arith::Analyzer *analyzer,
       (op.dst.scope() != "shared.dyn" && op.dst.scope() != "shared")) {
     return false;
   }
+  if (packed_lowbit::IsSM120Fp4GlobalSharedCopy(op, target)) {
+    return false;
+  }
   if (check_last_dim &&
       analyzer->CanProve(
           FloorMod(
@@ -176,6 +180,9 @@ bool CheckBulkStore(const CopyNode &op, Target target,
   }
   if ((op.src.scope() != "shared.dyn" && op.src.scope() != "shared") ||
       op.dst.scope() != "global") {
+    return false;
+  }
+  if (packed_lowbit::IsSM120Fp4GlobalSharedCopy(op, target)) {
     return false;
   }
   if (check_last_dim &&
@@ -379,6 +386,10 @@ struct CopyFacts {
   bool can_stsm = false;
   bool can_tmem_load = false;
   bool can_tmem_store = false;
+  // Semantic packed-low-bit global/shared copies may need carrier conversion
+  // before the SM120 byte-container ldmatrix path can consume them. Keep them
+  // on the normal copy path instead of byte-preserving TMA/cp.async.
+  bool requires_packed_lowbit_copy = false;
   std::string tma_unavailable_reason;
   std::string async_unavailable_reason;
 };
@@ -481,6 +492,8 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
   facts.no_implicit_async_commit_wait = GetNoImplicitAsyncCommitWait(op);
   facts.disable_tma = GetDisableTMA(op);
   facts.cluster_mask = GetClusterMask(op);
+  facts.requires_packed_lowbit_copy =
+      packed_lowbit::RequiresSM120Fp4PackedLowbitCopy(op, ctx.target);
   facts.tma_unavailable_reason = MakeTmaUnavailableReason(op);
   facts.async_unavailable_reason = MakeAsyncUnavailableReason(op, ctx.target);
   facts.pass_context_disables_tma =
@@ -539,7 +552,9 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
                        ctx.emit_diagnostics);
   }
 
-  facts.can_cp_async = CheckCPAsyncCopy(op, ctx.target, layout_map, analyzer);
+  facts.can_cp_async =
+      !facts.requires_packed_lowbit_copy &&
+      CheckCPAsyncCopy(op, ctx.target, layout_map, analyzer);
   facts.can_ldsm = CheckLDSMCopy(op, ctx.target);
   facts.can_stsm = CheckSTSMCopy(op, ctx.target);
   facts.can_tmem_load = CheckTMemLoad(op, ctx.target);
@@ -584,9 +599,19 @@ CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
                : Supported(inst);
   }
 
-  if (facts.explicit_cp_async || facts.no_implicit_async_commit_wait) {
+  if (facts.explicit_cp_async) {
     return facts.can_cp_async ? Supported(CopyInst::kCPAsync)
                               : Unsupported(facts.async_unavailable_reason);
+  }
+
+  if (facts.no_implicit_async_commit_wait) {
+    if (facts.can_cp_async) {
+      return Supported(CopyInst::kCPAsync);
+    }
+    if (facts.requires_packed_lowbit_copy) {
+      return Supported(SelectSyncLikeInst(facts));
+    }
+    return Unsupported(facts.async_unavailable_reason);
   }
 
   if (!facts.disable_tma && !facts.pass_context_disables_tma) {
@@ -657,9 +682,19 @@ CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,
                : Supported(inst);
   }
 
-  if (facts.explicit_cp_async || facts.no_implicit_async_commit_wait) {
+  if (facts.explicit_cp_async) {
     return facts.can_cp_async ? Supported(CopyInst::kCPAsync)
                               : Unsupported(facts.async_unavailable_reason);
+  }
+
+  if (facts.no_implicit_async_commit_wait) {
+    if (facts.can_cp_async) {
+      return Supported(CopyInst::kCPAsync);
+    }
+    if (facts.requires_packed_lowbit_copy) {
+      return Supported(SelectSyncLikeInst(facts));
+    }
+    return Unsupported(facts.async_unavailable_reason);
   }
 
   if (!facts.disable_tma) {

@@ -81,12 +81,24 @@ private:
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;
   bool HandleLateIntrinsicCall(const CallNode *op, std::ostream &os);
-  // FP4 address helpers distinguish packed global storage from SM120 padded
-  // shared storage; local fragments remain semantic FP4 arrays. Codegen picks
-  // packed access by storage scope instead of keeping a second packed name map.
+  // cp.async width helpers return storage widths, not predicates.
+  int GetAccessPtrElementBits(const PrimExpr &expr) const;
+  int GetTileLangCPAsyncTransferBytes(const CallNode *op) const;
+  // FP4 address helpers distinguish the semantic public dtype from its
+  // physical storage: default packed global ABI, SM120 byte-carrier
+  // global/shared layout when marked by policy, legacy SM120 padded shared, and
+  // semantic local fragments.
   std::string GetBufferStorageScope(const VarNode *buffer_var) const;
+  bool IsSM120Fp4ByteCarrierBuffer(const VarNode *buffer_var) const;
+  DataType GetHandleStorageType(const VarNode *buffer_var,
+                                DataType element_dtype) const;
+  void PrintHandleTypeAndRegister(const tirx::Var &var, std::ostream &os);
   bool IsFp4PackedStorage(const VarNode *buffer_var,
                           DataType element_dtype) const;
+  bool IsFp4ByteCarrierStorage(const VarNode *buffer_var,
+                               DataType element_dtype) const;
+  bool IsFp4ByteCarrierSharedStorage(const VarNode *buffer_var,
+                                     DataType element_dtype) const;
   bool IsFp4PaddedSharedStorage(const VarNode *buffer_var,
                                 DataType element_dtype) const;
   bool IsFp4SemanticLocalStorage(const VarNode *buffer_var,
@@ -115,6 +127,9 @@ private:
   bool enable_fp6_{false};
   // whether enable fp4
   bool enable_fp4_{false};
+  // Semantic SM120 FP4 MMA operands that use byte-carrier global/shared
+  // storage, matching the ordinary ldmatrix path.
+  std::unordered_set<std::string> sm120_fp4_byte_carrier_buffers_;
   // whether enable int8
   bool enable_int8_{false};
   // whether enable sparse gemm

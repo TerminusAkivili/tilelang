@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "../op/builtin.h"
+#include "../op/packed_lowbit.h"
 #include "arg_binder.h"
 #include "common/attr.h"
 #include "merge_if_stmt.h"
@@ -529,7 +530,8 @@ PrimFunc MakePackedAPI(PrimFunc func) {
   }
 
   binder.BindDLTensors(buffer_def, device_type, device_id, name_hint,
-                       used_param_buffers, detector.used_shape_vars);
+                       used_param_buffers, detector.used_shape_vars,
+                       packed_lowbit::GetByteCarrierBuffers(func));
   for (const auto &[var, buffer] : buffer_def) {
     // Prefer buffer data var name in diagnostics to avoid exposing low-level
     // handle vars

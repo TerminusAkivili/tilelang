@@ -369,4 +369,47 @@ TL_DEVICE void tl_fp4_packed_store(fp4_e2_2_t *packed, int idx, fp4_e2_t val) {
   }
 }
 
+// Load sixteen packed fp4 elements from an 8-byte global address. The result
+// stays in fp4_e2_16_t form so vector-load lowering can keep semantic FP4
+// register types before expanding into byte-carrier shared memory.
+TL_DEVICE fp4_e2_16_t tl_fp4_load_packed_16(const void *ptr) {
+  uint2 raw;
+  asm volatile("{\n"
+#if TL_ENABLE_L2_PREFETCH
+               "  ld.global.L2::128B.v2.u32 {%0, %1}, [%2];\n"
+#else
+               "  ld.global.v2.u32 {%0, %1}, [%2];\n"
+#endif
+               "}\n"
+               : "=r"(raw.x), "=r"(raw.y)
+               : "l"(ptr));
+  fp4_e2_16_t result;
+  *reinterpret_cast<uint2 *>(&result) = raw;
+  return result;
+}
+
+// Expand eight packed fp4 nibbles into eight byte-sized slots. This feeds the
+// SM120 byte-carrier shared path used with ordinary ldmatrix.
+TL_DEVICE uint2 tl_fp4_expand_nibbles_to_bytes(unsigned int x) {
+  unsigned int lo = x & 0x0F0F0F0FU;
+  unsigned int hi = (x >> 4) & 0x0F0F0F0FU;
+  uint2 result;
+  result.x = __byte_perm(lo, hi, 0x5140);
+  result.y = __byte_perm(lo, hi, 0x7362);
+  return result;
+}
+
+// Convert a packed 16-lane FP4 vector into sixteen byte-sized shared elements.
+TL_DEVICE uint4 tl_fp4_unpack_16_to_bytes(const fp4_e2_16_t &value) {
+  uint2 packed = *reinterpret_cast<const uint2 *>(&value);
+  uint2 lo = tl_fp4_expand_nibbles_to_bytes(packed.x);
+  uint2 hi = tl_fp4_expand_nibbles_to_bytes(packed.y);
+  uint4 result;
+  result.x = lo.x;
+  result.y = lo.y;
+  result.z = hi.x;
+  result.w = hi.y;
+  return result;
+}
+
 #endif

@@ -37,6 +37,7 @@
 #include <unordered_set>
 
 #include "../op/builtin.h"
+#include "../op/packed_lowbit.h"
 #include "common/assume.h"
 #include "common/attr.h"
 #include "tir/analysis/var_use_def_analysis.h"
@@ -107,6 +108,7 @@ public:
   }
 
   bool found_device_region() const { return found_device_region_; }
+  Array<String> byte_carrier_buffers() const { return byte_carrier_buffers_; }
 
 private:
   bool found_device_region_{false};
@@ -324,6 +326,35 @@ private:
     body = BufferUseRemapper(buffer_remap)(std::move(body));
     buffers_to_declare = new_buffers_to_declare;
 
+    Array<String> byte_carrier_buffers;
+    if (TargetIsSM120(device_target) && packed_lowbit::HasFp4MmaOperand(body)) {
+      auto copied_fp4_buffers =
+          packed_lowbit::CollectSM120Fp4GlobalSharedCopyBuffers(
+              body, device_target, /*allow_empty_global=*/true);
+      // Prefer actual global/shared FP4 copy operands when they are still
+      // visible as CopyNode calls. Some paths reach this pass after copy-like
+      // structure has already been rewritten, so fall back to the function-level
+      // semantic FP4 operand policy instead of silently disabling the SM120
+      // byte-carrier path.
+      bool use_copy_filter = !copied_fp4_buffers.empty();
+      std::unordered_set<std::string> seen;
+      auto add_byte_carrier_buffer = [&](const tirx::Buffer &buf) {
+        if (packed_lowbit::IsFp4E2M1(buf->dtype) &&
+            (!use_copy_filter ||
+             copied_fp4_buffers.count(buf->data->name_hint)) &&
+            seen.insert(buf->data->name_hint).second) {
+          byte_carrier_buffers.push_back(String(buf->data->name_hint));
+        }
+      };
+      for (const auto &kv : host_buffer_map_) {
+        add_byte_carrier_buffer(kv.second);
+      }
+      for (const auto &buf : buffers_to_declare) {
+        if (IsSharedBuffer(buf)) {
+          add_byte_carrier_buffer(buf);
+        }
+      }
+    }
     // CodeGenCPU is used for some device-side targets, such as
     // "ext_dev", and expects to be able to return a int32_t status
     // code.
@@ -369,6 +400,11 @@ private:
         {tirx::attr::kNoAlias, true},
         {tirx::attr::kIsGlobalFunc, true},
         {tl::attr::kNonRestrictParams, remapped_non_restrict_params}};
+    if (!byte_carrier_buffers.empty()) {
+      byte_carrier_buffers_ = byte_carrier_buffers;
+      device_attrs.Set(packed_lowbit::kByteCarrierBuffersAttr,
+                       byte_carrier_buffers);
+    }
     if (cluster_dims_.defined()) {
       device_attrs.Set("cluster_dims", cluster_dims_.value());
     }
@@ -411,6 +447,8 @@ private:
   std::function<GlobalVar()> var_supply_;
   // Collect assumes in host side
   Array<const tirx::AttrStmtNode *> host_assumes_;
+  // SM120 semantic FP4 operands that use byte-carrier physical storage.
+  Array<String> byte_carrier_buffers_;
 };
 
 tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
@@ -447,6 +485,10 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
         }
       }
     }
+  }
+  if (!splitter.byte_carrier_buffers().empty()) {
+    func = WithAttr(std::move(func), packed_lowbit::kByteCarrierBuffersAttr,
+                    splitter.byte_carrier_buffers());
   }
   return func;
 }
